@@ -1,45 +1,99 @@
-name: Build Telegram APK
+name: Build Telegram Android (arm64)
 
 on:
-  push:
-    branches: [ master ]
   workflow_dispatch:
+  push:
+    branches: [ "master" ]
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
     steps:
-      - name: Checkout
+      - name: Reclaim runner disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/* || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo apt-get clean
+          sudo docker system prune -af || true
+          df -h
+
+      - name: Checkout with shallow submodules
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           submodules: recursive
+          fetch-tags: false
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install SDK packages
+      - name: Install exact Android components
+        shell: bash
         run: |
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          set -euxo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "cmake;3.22.1" \
+            "ndk;27.2.12479018"
 
-      - name: Build release APK
+      - name: Configure Gradle for low disk usage
+        shell: bash
         run: |
-          export ANDROID_HOME=$ANDROID_SDK_ROOT
-          export ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018
-          ./gradlew assembleAfatRelease --no-daemon --stacktrace
+          cat >> "$GITHUB_WORKSPACE/gradle.properties" <<'EOF'
+          org.gradle.daemon=false
+          org.gradle.parallel=false
+          org.gradle.workers.max=2
+          org.gradle.caching=false
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8
+          EOF
+
+      - name: Prepare release configuration
+        shell: bash
+        run: |
+          test -f TMessagesProj/config/release.keystore
+          test -f TMessagesProj/google-services.json
+          test -f TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+
+      - name: Build one release variant
+        shell: bash
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :TMessagesProj_App:assembleAfatRelease \
+            --no-daemon \
+            --max-workers=2 \
+            --stacktrace
+
+      - name: Show disk usage
+        if: always()
+        shell: bash
+        run: |
+          df -h
+          du -sh .gradle build TMessagesProj/build TMessagesProj_App/build 2>/dev/null || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Telegram-Afat-Release
-          path: |
-            TMessagesProj_App/build/outputs/apk/afat/release/*.apk
+          name: telegram-arm64-release
           if-no-files-found: error
+          path: |
+            TMessagesProj_App/build/outputs/apk/**/*.apk
+            TMessagesProj_App/build/outputs/bundle/**/*.aab
